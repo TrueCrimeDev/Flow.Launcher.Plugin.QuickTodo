@@ -6,7 +6,7 @@
   "Author": "TrueCrimeAudit",
   "Version": "1.1.0",
   "Language": "csharp",
-  "Website": "https://github.com/TrueCrimeAudit/Flow.Launcher.Plugin.QuickTodo",
+  "Website": "https://github.com/TrueCrimeDev/Flow.Launcher.Plugin.QuickTodo",
   "ExecuteFileName": "Flow.Launcher.Plugin.QuickTodo.dll",
   "IcoPath": "Images\\todo.png"
 }
