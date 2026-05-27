@@ -2,11 +2,11 @@
   "ID": "F8A3B1D4E6C2947F5A0B8D3E1C6F2A74",
   "ActionKeyword": "td",
   "Name": "QuickTodo",
-  "Description": "Quick task management with priorities, categories, due dates, and reminders.",
+  "Description": "Quick task management with priorities, categories, reminders, and Outlook Tasks support.",
   "Author": "TrueCrimeAudit",
-  "Version": "1.0.0",
+  "Version": "1.1.0",
   "Language": "csharp",
-  "Website": "",
+  "Website": "https://github.com/TrueCrimeAudit/Flow.Launcher.Plugin.QuickTodo",
   "ExecuteFileName": "Flow.Launcher.Plugin.QuickTodo.dll",
   "IcoPath": "Images\\todo.png"
 }

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows.Controls;
 using Flow.Launcher.Plugin;
 using Flow.Launcher.Plugin.QuickTodo.Models;
@@ -11,6 +12,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
 {
     private PluginInitContext _context = null!;
     private TodoStore _store = null!;
+    private OutlookTaskScriptClient _outlookTasks = null!;
     private QueryHandler _queryHandler = null!;
     private ReminderService _reminderService = null!;
     private QuickTodoSettings _settings = null!;
@@ -27,7 +29,11 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
             logWarn: (cls, msg) => context.API.LogWarn(cls, msg));
         _store.Load();
 
-        _queryHandler = new QueryHandler(_store, context);
+        _outlookTasks = new OutlookTaskScriptClient(
+            Path.Combine(AppContext.BaseDirectory, "Scripts", "QuickTodo.OutlookTasks.ps1"),
+            logWarn: (cls, msg) => context.API.LogWarn(cls, msg));
+
+        _queryHandler = new QueryHandler(_store, context, _outlookTasks);
 
         _reminderService = new ReminderService(
             _store,

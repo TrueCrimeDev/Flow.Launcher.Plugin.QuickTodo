@@ -9,6 +9,7 @@ public class QueryHandler
 {
     private readonly TodoStore _store;
     private readonly PluginInitContext _context;
+    private readonly OutlookTaskScriptClient? _outlookTasks;
 
     private static readonly Regex PriorityRegex = new(
         @"!(h|high|m|medium|l|low)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -19,10 +20,11 @@ public class QueryHandler
     private static readonly Regex DateRegex = new(
         @"#(\S+)", RegexOptions.Compiled);
 
-    public QueryHandler(TodoStore store, PluginInitContext context)
+    public QueryHandler(TodoStore store, PluginInitContext context, OutlookTaskScriptClient? outlookTasks = null)
     {
         _store = store;
         _context = context;
+        _outlookTasks = outlookTasks;
     }
 
     public List<Result> Handle(Query query)
@@ -38,6 +40,7 @@ public class QueryHandler
         {
             "list" => BuildListResults(query.SecondToEndSearch),
             "cat" => BuildCategoryResults(query.SecondToEndSearch),
+            "outlook" => BuildOutlookResults(query.SecondToEndSearch),
             _ => BuildAddResults(search)
         };
     }
@@ -297,11 +300,149 @@ public class QueryHandler
         return results;
     }
 
+    // --- OUTLOOK MODE ---
+
+    private List<Result> BuildOutlookResults(string args)
+    {
+        if (_outlookTasks == null)
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Outlook task bridge is not available",
+                    SubTitle = "The plugin was not initialized with an Outlook task client",
+                    IcoPath = "Images\\todo-high.png",
+                    Score = 1000
+                }
+            };
+        }
+
+        var input = args.Trim();
+        if (string.IsNullOrEmpty(input))
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Add Outlook task...",
+                    SubTitle = "Type: td outlook <task> #tomorrow !high @Work",
+                    IcoPath = "Images\\todo.png",
+                    Score = 1000,
+                    AutoCompleteText = "td outlook ",
+                    Action = _ => false
+                },
+                new()
+                {
+                    Title = "List Outlook tasks",
+                    SubTitle = "Type: td outlook list",
+                    IcoPath = "Images\\todo.png",
+                    Score = 900,
+                    AutoCompleteText = "td outlook list",
+                    Action = _ =>
+                    {
+                        _context.API.ChangeQuery("td outlook list");
+                        return false;
+                    }
+                }
+            };
+        }
+
+        var parts = input.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+        var subCommand = parts.Length > 0 ? parts[0].ToLowerInvariant() : "";
+
+        if (subCommand == "list")
+        {
+            return BuildOutlookListResults();
+        }
+
+        return BuildOutlookAddResults(input);
+    }
+
+    private List<Result> BuildOutlookAddResults(string input)
+    {
+        var parsed = ParseModifiers(input, validateCategory: false);
+        var subParts = new List<string> { parsed.Priority.ToString(), parsed.Category };
+        if (parsed.DueDate.HasValue)
+            subParts.Add($"Due: {parsed.DueDate.Value:yyyy-MM-dd}");
+
+        return new List<Result>
+        {
+            new()
+            {
+                Title = $"Add to Outlook: {parsed.Title}",
+                SubTitle = string.Join(" | ", subParts),
+                IcoPath = PriorityIcon(parsed.Priority),
+                Score = 5000,
+                Action = _ =>
+                {
+                    try
+                    {
+                        _outlookTasks!.Add(parsed.Title, parsed.Priority, parsed.Category, parsed.DueDate);
+                        _context.API.ShowMsg("QuickTodo Outlook", $"Added: {parsed.Title}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _context.API.ShowMsg("QuickTodo Outlook", ex.Message);
+                    }
+                    return true;
+                }
+            }
+        };
+    }
+
+    private List<Result> BuildOutlookListResults()
+    {
+        try
+        {
+            var tasks = _outlookTasks!.List()
+                .OrderBy(t => t.DueDate ?? DateTime.MaxValue)
+                .ThenByDescending(t => t.Priority)
+                .ToList();
+
+            if (tasks.Count == 0)
+            {
+                return new List<Result>
+                {
+                    new()
+                    {
+                        Title = "No incomplete Outlook tasks found",
+                        SubTitle = "Add one with: td outlook <task>",
+                        IcoPath = "Images\\todo.png",
+                        Score = 1000
+                    }
+                };
+            }
+
+            var results = new List<Result>();
+            var score = 1000;
+            foreach (var task in tasks)
+            {
+                results.Add(OutlookTaskToResult(task, score--));
+            }
+
+            return results;
+        }
+        catch (Exception ex)
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Unable to read Outlook tasks",
+                    SubTitle = ex.Message,
+                    IcoPath = "Images\\todo-high.png",
+                    Score = 1000
+                }
+            };
+        }
+    }
+
     // --- HELPERS ---
 
     public record ParsedInput(string Title, Priority Priority, string Category, DateTime? DueDate, string? CategoryWarning = null);
 
-    public ParsedInput ParseModifiers(string input)
+    public ParsedInput ParseModifiers(string input, bool validateCategory = true)
     {
         var priority = Priority.Medium;
         string category = "Personal";
@@ -325,6 +466,10 @@ public class QueryHandler
             if (match != null)
             {
                 category = match;
+            }
+            else if (!validateCategory)
+            {
+                category = requested;
             }
             else
             {
@@ -389,6 +534,32 @@ public class QueryHandler
             {
                 _store.ToggleComplete(task.Id);
                 _context.API.ReQuery();
+                return false;
+            }
+        };
+    }
+
+    private Result OutlookTaskToResult(TodoItem task, int score)
+    {
+        return new Result
+        {
+            Title = task.Title,
+            SubTitle = FormatSubTitle(task),
+            IcoPath = PriorityIcon(task.Priority),
+            Score = score,
+            ContextData = task,
+            Action = _ =>
+            {
+                try
+                {
+                    _outlookTasks!.SetComplete(task, complete: true);
+                    _context.API.ShowMsg("QuickTodo Outlook", $"Completed: {task.Title}");
+                    _context.API.ReQuery();
+                }
+                catch (Exception ex)
+                {
+                    _context.API.ShowMsg("QuickTodo Outlook", ex.Message);
+                }
                 return false;
             }
         };

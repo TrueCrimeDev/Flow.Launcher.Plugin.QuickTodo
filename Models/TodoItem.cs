@@ -21,4 +21,6 @@ public class TodoItem
     public DateTime CreatedAt { get; set; } = DateTime.Now;
     public DateTime? CompletedAt { get; set; }
     public DateTime? SnoozedUntil { get; set; }
+    public string? OutlookEntryId { get; set; }
+    public string? OutlookStoreId { get; set; }
 }
