@@ -33,7 +33,8 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
 
         _outlookTasks = new OutlookTaskScriptClient(
             Path.Combine(AppContext.BaseDirectory, "Scripts", "QuickTodo.OutlookTasks.ps1"),
-            logWarn: (cls, msg) => context.API.LogWarn(cls, msg));
+            logWarn: (cls, msg) => context.API.LogWarn(cls, msg),
+            logInfo: (cls, msg) => context.API.LogInfo(cls, msg));
 
         _queryHandler = new QueryHandler(_store, context, _outlookTasks);
 

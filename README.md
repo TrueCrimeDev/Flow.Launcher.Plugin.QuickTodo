@@ -10,6 +10,7 @@ QuickTodo is a Flow Launcher plugin for creating and reviewing lightweight tasks
 - `td edit` lists tasks to edit; pick one to prefill `td edit <id> <title>`, then change the title or any modifier and press Enter to save. Also available from a task's context menu ("Edit Task").
 - `td outlook <task> !low @Work #tomorrow` creates a real Outlook task through desktop Outlook's COM object model.
 - `td outlook list` lists incomplete Outlook tasks. Press Enter on a result to mark it complete.
+- `td outlook diag` (or `tdo diag`) probes the Outlook COM connector step by step (bind, MAPI namespace, profile, default Tasks folder, task counts) and reports where it fails. Press Enter on the summary row to copy the full diagnostics JSON. Each bridge invocation is also logged to the Flow Launcher log.
 - `tdo <task> !low @Work #tomorrow` is a shortcut for `td outlook <task>` — the `tdo` keyword goes straight to Outlook mode.
 - `tdo list` lists incomplete Outlook tasks (same as `td outlook list`).
 - `td cat add <name>` adds a local category.

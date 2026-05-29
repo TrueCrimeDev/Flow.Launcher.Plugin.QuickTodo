@@ -18,11 +18,16 @@ public class OutlookTaskScriptClient
 
     private readonly string _scriptPath;
     private readonly Action<string, string>? _logWarn;
+    private readonly Action<string, string>? _logInfo;
 
-    public OutlookTaskScriptClient(string? scriptPath = null, Action<string, string>? logWarn = null)
+    public OutlookTaskScriptClient(
+        string? scriptPath = null,
+        Action<string, string>? logWarn = null,
+        Action<string, string>? logInfo = null)
     {
         _scriptPath = scriptPath ?? Path.Combine(AppContext.BaseDirectory, "Scripts", "QuickTodo.OutlookTasks.ps1");
         _logWarn = logWarn;
+        _logInfo = logInfo;
     }
 
     public TodoItem Add(string title, Priority priority, string category, DateTime? dueDate,
@@ -48,6 +53,14 @@ public class OutlookTaskScriptClient
             ?? throw new InvalidOperationException("Outlook task script returned no task record.");
 
         return ConvertFromOutlookRecord(record);
+    }
+
+    public OutlookDiagnostics Diagnose()
+    {
+        var args = NewBaseArguments("diag");
+        var output = Run(args);
+        return JsonSerializer.Deserialize<OutlookDiagnostics>(output, JsonOptions)
+            ?? throw new InvalidOperationException("Outlook diagnostics returned no data.");
     }
 
     public List<TodoItem> List(bool includeCompleted = false)
@@ -157,6 +170,10 @@ public class OutlookTaskScriptClient
             process.StartInfo.ArgumentList.Add(arg);
         }
 
+        var command = "powershell.exe " + string.Join(" ", arguments.Select(QuoteIfNeeded));
+        _logInfo?.Invoke(nameof(OutlookTaskScriptClient), $"COM bridge invoke: {command}");
+
+        var stopwatch = Stopwatch.StartNew();
         process.Start();
 
         var stdout = process.StandardOutput.ReadToEnd();
@@ -166,12 +183,24 @@ public class OutlookTaskScriptClient
         {
             try { process.Kill(entireProcessTree: true); }
             catch { /* best effort */ }
+            _logWarn?.Invoke(nameof(OutlookTaskScriptClient),
+                $"COM bridge timed out after 15s: {command}");
             throw new TimeoutException("Outlook task script timed out after 15 seconds.");
+        }
+
+        stopwatch.Stop();
+        _logInfo?.Invoke(nameof(OutlookTaskScriptClient),
+            $"COM bridge exit={process.ExitCode} in {stopwatch.ElapsedMilliseconds}ms, " +
+            $"stdout={stdout.Length} chars, stderr={stderr.Length} chars");
+
+        // stderr can be present even on success (e.g. best-effort recurrence warnings).
+        if (!string.IsNullOrWhiteSpace(stderr))
+        {
+            _logWarn?.Invoke(nameof(OutlookTaskScriptClient), $"COM bridge stderr: {stderr.Trim()}");
         }
 
         if (process.ExitCode != 0)
         {
-            _logWarn?.Invoke(nameof(OutlookTaskScriptClient), stderr);
             throw new InvalidOperationException(string.IsNullOrWhiteSpace(stderr)
                 ? $"Outlook task script failed with exit code {process.ExitCode}."
                 : stderr.Trim());
@@ -179,6 +208,9 @@ public class OutlookTaskScriptClient
 
         return stdout.Trim();
     }
+
+    private static string QuoteIfNeeded(string arg)
+        => arg.Contains(' ') ? $"\"{arg}\"" : arg;
 
     private static TodoItem ConvertFromOutlookRecord(OutlookTaskRecord record)
     {
@@ -251,4 +283,28 @@ public class OutlookTaskScriptClient
         public string? Categories { get; set; }
         public string? Body { get; set; }
     }
+}
+
+/// <summary>Result of probing the Outlook COM connector, one entry per step.</summary>
+public sealed class OutlookDiagnostics
+{
+    public bool Ok { get; set; }
+    public string? BindMethod { get; set; }
+    public string? OutlookVersion { get; set; }
+    public string? ProfileName { get; set; }
+    public string? DefaultStore { get; set; }
+    public string? TasksFolderName { get; set; }
+    public int? TaskCount { get; set; }
+    public int? IncompleteTaskCount { get; set; }
+    public string? PowerShellVersion { get; set; }
+    public bool Is64BitProcess { get; set; }
+    public List<OutlookDiagnosticStep> Steps { get; set; } = new();
+    public string? Error { get; set; }
+}
+
+public sealed class OutlookDiagnosticStep
+{
+    public string Name { get; set; } = string.Empty;
+    public bool Ok { get; set; }
+    public string? Detail { get; set; }
 }

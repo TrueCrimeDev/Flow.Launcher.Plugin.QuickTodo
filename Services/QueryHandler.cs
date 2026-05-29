@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Flow.Launcher.Plugin;
 using Flow.Launcher.Plugin.QuickTodo.Models;
@@ -492,6 +493,19 @@ public class QueryHandler
                         _context.API.ChangeQuery($"{prefix} list");
                         return false;
                     }
+                },
+                new()
+                {
+                    Title = "Diagnose Outlook connection",
+                    SubTitle = $"Type: {prefix} diag — probe the COM bridge step by step",
+                    IcoPath = "Images\\todo.png",
+                    Score = 800,
+                    AutoCompleteText = $"{prefix} diag",
+                    Action = _ =>
+                    {
+                        _context.API.ChangeQuery($"{prefix} diag");
+                        return false;
+                    }
                 }
             };
         }
@@ -502,6 +516,11 @@ public class QueryHandler
         if (subCommand == "list")
         {
             return BuildOutlookListResults();
+        }
+
+        if (subCommand == "diag")
+        {
+            return BuildOutlookDiagResults();
         }
 
         return BuildOutlookAddResults(input);
@@ -587,6 +606,104 @@ public class QueryHandler
                 }
             };
         }
+    }
+
+    // --- OUTLOOK DIAGNOSTICS ---
+
+    private List<Result> BuildOutlookDiagResults()
+    {
+        if (_outlookTasks == null)
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Outlook task bridge is not available",
+                    SubTitle = "The plugin was not initialized with an Outlook task client",
+                    IcoPath = "Images\\todo-high.png",
+                    Score = 1000
+                }
+            };
+        }
+
+        OutlookDiagnostics diag;
+        try
+        {
+            diag = _outlookTasks.Diagnose();
+        }
+        catch (Exception ex)
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Outlook diagnostics failed to run",
+                    SubTitle = $"{ex.Message} — Enter to copy details",
+                    IcoPath = "Images\\todo-high.png",
+                    Score = 5000,
+                    Action = _ =>
+                    {
+                        _context.API.CopyToClipboard(ex.ToString());
+                        return true;
+                    }
+                }
+            };
+        }
+
+        var results = new List<Result>();
+        var score = 5000;
+
+        results.Add(new Result
+        {
+            Title = diag.Ok ? "Outlook connection OK" : "Outlook connection FAILED",
+            SubTitle = BuildDiagSummary(diag),
+            IcoPath = diag.Ok ? "Images\\todo-done.png" : "Images\\todo-high.png",
+            Score = score--,
+            Action = _ =>
+            {
+                var json = JsonSerializer.Serialize(diag, new JsonSerializerOptions { WriteIndented = true });
+                _context.API.CopyToClipboard(json);
+                return true;
+            }
+        });
+
+        foreach (var step in diag.Steps)
+        {
+            var mark = step.Ok ? "✓" : "✗";
+            results.Add(new Result
+            {
+                Title = $"{mark} {step.Name}",
+                SubTitle = string.IsNullOrWhiteSpace(step.Detail) ? "" : step.Detail,
+                IcoPath = step.Ok ? "Images\\todo-done.png" : "Images\\todo-high.png",
+                Score = score--
+            });
+        }
+
+        if (!string.IsNullOrWhiteSpace(diag.Error))
+        {
+            results.Add(new Result
+            {
+                Title = "Error detail",
+                SubTitle = diag.Error,
+                IcoPath = "Images\\todo-high.png",
+                Score = score--
+            });
+        }
+
+        return results;
+    }
+
+    private static string BuildDiagSummary(OutlookDiagnostics d)
+    {
+        var parts = new List<string>();
+        if (d.BindMethod != null) parts.Add($"bind: {d.BindMethod}");
+        if (d.OutlookVersion != null) parts.Add($"Outlook {d.OutlookVersion}");
+        if (d.ProfileName != null) parts.Add($"profile: {d.ProfileName}");
+        if (d.TasksFolderName != null) parts.Add($"folder: {d.TasksFolderName}");
+        if (d.TaskCount.HasValue) parts.Add($"{d.IncompleteTaskCount}/{d.TaskCount} open");
+        parts.Add($"PS {d.PowerShellVersion}");
+        parts.Add(d.Is64BitProcess ? "x64" : "x86");
+        return string.Join(" | ", parts) + " — Enter to copy JSON";
     }
 
     // --- HELPERS ---

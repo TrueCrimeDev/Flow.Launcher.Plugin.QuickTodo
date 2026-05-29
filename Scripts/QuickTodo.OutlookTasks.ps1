@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete')]
+    [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete', 'diag')]
     [string] $Command = 'list',
 
     [string] $Subject,
@@ -298,6 +298,104 @@ function Remove-OutlookTask {
     }
 }
 
+function Invoke-OutlookDiagnostics {
+    # Probes each COM step independently so a failure point is pinpointed rather
+    # than collapsing into one opaque error. Never throws: returns a report object.
+    $steps = [System.Collections.Generic.List[object]]::new()
+
+    function Add-DiagStep {
+        param([string] $Name, [bool] $Ok, [string] $Detail)
+        $steps.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
+    }
+
+    $report = [ordered]@{
+        Ok                  = $false
+        BindMethod          = $null
+        OutlookVersion      = $null
+        ProfileName         = $null
+        DefaultStore        = $null
+        TasksFolderName     = $null
+        TaskCount           = $null
+        IncompleteTaskCount = $null
+        PowerShellVersion   = $PSVersionTable.PSVersion.ToString()
+        Is64BitProcess      = [Environment]::Is64BitProcess
+        Steps               = $steps
+        Error               = $null
+    }
+
+    $application = $null
+    try {
+        try {
+            $application = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
+            $report.BindMethod = 'GetActiveObject (running instance)'
+        }
+        catch {
+            $application = New-Object -ComObject 'Outlook.Application'
+            $report.BindMethod = 'New-Object (started instance)'
+        }
+        Add-DiagStep -Name 'Bind Outlook.Application' -Ok $true -Detail $report.BindMethod
+    }
+    catch {
+        Add-DiagStep -Name 'Bind Outlook.Application' -Ok $false -Detail $_.Exception.Message
+        $report.Error = $_.Exception.Message
+        return [pscustomobject]$report
+    }
+
+    try {
+        $report.OutlookVersion = $application.Version
+        Add-DiagStep -Name 'Read Outlook.Version' -Ok $true -Detail $application.Version
+    }
+    catch {
+        Add-DiagStep -Name 'Read Outlook.Version' -Ok $false -Detail $_.Exception.Message
+    }
+
+    $namespace = $null
+    try {
+        $namespace = $application.GetNamespace('MAPI')
+        Add-DiagStep -Name 'Get MAPI namespace' -Ok $true -Detail 'ok'
+    }
+    catch {
+        Add-DiagStep -Name 'Get MAPI namespace' -Ok $false -Detail $_.Exception.Message
+        $report.Error = $_.Exception.Message
+        return [pscustomobject]$report
+    }
+
+    try {
+        $report.ProfileName = $namespace.CurrentProfileName
+        Add-DiagStep -Name 'Read current profile' -Ok $true -Detail $namespace.CurrentProfileName
+    }
+    catch {
+        Add-DiagStep -Name 'Read current profile' -Ok $false -Detail $_.Exception.Message
+    }
+
+    $folder = $null
+    try {
+        $folder = $namespace.GetDefaultFolder(13)
+        $report.TasksFolderName = $folder.Name
+        try { $report.DefaultStore = $folder.Store.DisplayName } catch { }
+        Add-DiagStep -Name 'Get default Tasks folder (13)' -Ok $true -Detail $folder.Name
+    }
+    catch {
+        Add-DiagStep -Name 'Get default Tasks folder (13)' -Ok $false -Detail $_.Exception.Message
+        $report.Error = $_.Exception.Message
+        return [pscustomobject]$report
+    }
+
+    try {
+        $items = $folder.Items
+        $report.TaskCount = [int] $items.Count
+        $incomplete = $items.Restrict('[Complete] = false')
+        $report.IncompleteTaskCount = [int] $incomplete.Count
+        Add-DiagStep -Name 'Enumerate tasks' -Ok $true -Detail "$($report.TaskCount) total, $($report.IncompleteTaskCount) incomplete"
+    }
+    catch {
+        Add-DiagStep -Name 'Enumerate tasks' -Ok $false -Detail $_.Exception.Message
+    }
+
+    $report.Ok = $true
+    return [pscustomobject]$report
+}
+
 function Write-QuickTodoOutput {
     param(
         [AllowNull()] [object] $Value,
@@ -315,7 +413,7 @@ function Write-QuickTodoOutput {
 function Invoke-QuickTodoOutlookTaskCommand {
     [CmdletBinding()]
     param(
-        [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete')]
+        [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete', 'diag')]
         [string] $Command = 'list',
         [string] $Subject,
         [string] $Body,
@@ -330,6 +428,13 @@ function Invoke-QuickTodoOutlookTaskCommand {
         [switch] $IncludeCompleted,
         [switch] $AsJson
     )
+
+    # Diagnostics binds Outlook itself and reports failures as data, so it must run
+    # before the unconditional bind below (which would otherwise throw first).
+    if ($Command -eq 'diag') {
+        Write-QuickTodoOutput -Value (Invoke-OutlookDiagnostics) -AsJson:$AsJson
+        return
+    }
 
     $application = Get-OutlookApplication
     $namespace = Get-OutlookNamespace -Application $application
