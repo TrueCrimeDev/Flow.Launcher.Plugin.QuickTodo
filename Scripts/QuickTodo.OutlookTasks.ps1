@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete', 'diag')]
+    [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete', 'diag', 'search')]
     [string] $Command = 'list',
 
     [string] $Subject,
@@ -16,6 +16,9 @@ param(
     [string] $Recurrence = 'None',
     [string] $EntryId,
     [string] $StoreId,
+    [string] $Query,
+    [ValidateSet('CurrentFolder', 'AllFolders', 'Subfolders', 'AllOutlookItems')]
+    [string] $Scope = 'AllFolders',
     [switch] $IncludeCompleted,
     [switch] $AsJson
 )
@@ -23,15 +26,24 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Tracks whether THIS process started Outlook (vs attached to a running instance), so the
+# non-interactive commands can quit the instance they created instead of stranding an invisible
+# OUTLOOK.EXE. Set by Get-OutlookApplication.
+$script:OutlookStartedByUs = $false
+
 function Get-OutlookApplication {
     $progId = 'Outlook.Application'
 
     try {
-        return [System.Runtime.InteropServices.Marshal]::GetActiveObject($progId)
+        $app = [System.Runtime.InteropServices.Marshal]::GetActiveObject($progId)
+        $script:OutlookStartedByUs = $false
+        return $app
     }
     catch {
         try {
-            return New-Object -ComObject $progId
+            $app = New-Object -ComObject $progId
+            $script:OutlookStartedByUs = $true
+            return $app
         }
         catch {
             throw "Unable to bind $progId. Confirm desktop Outlook is installed and a MAPI profile is configured. $($_.Exception.Message)"
@@ -44,7 +56,15 @@ function Get-OutlookNamespace {
         [Parameter(Mandatory = $true)] [object] $Application
     )
 
-    return $Application.GetNamespace('MAPI')
+    $namespace = $Application.GetNamespace('MAPI')
+
+    # Favour a silent logon against the default profile. Without it, first folder access can raise a
+    # modal "choose profile"/password dialog on non-default configs — which, on an invisibly-started
+    # Outlook, hangs the bridge until the C# timeout. Best-effort: if logon isn't applicable (already
+    # logged on, no default profile) let the later folder call report the real error.
+    try { $namespace.Logon($null, $null, $false, $false) } catch { }
+
+    return $namespace
 }
 
 function ConvertTo-OutlookImportance {
@@ -161,7 +181,9 @@ function ConvertFrom-OutlookTaskItem {
         Complete = [bool] $Task.Complete
         Importance = ConvertFrom-OutlookImportance -Importance ([int] $Task.Importance)
         Categories = $Task.Categories
-        Body = $Task.Body
+        # Body is intentionally NOT read: nothing downstream consumes it, and reading it can
+        # block the COM call indefinitely on certain task items (observed hanging the whole
+        # list), which would stall every task read behind it.
     }
 }
 
@@ -298,6 +320,67 @@ function Remove-OutlookTask {
     }
 }
 
+function ConvertTo-OutlookSearchScope {
+    param(
+        [ValidateSet('CurrentFolder', 'AllFolders', 'Subfolders', 'AllOutlookItems')]
+        [string] $Scope = 'AllFolders'
+    )
+
+    # OlSearchScope: CurrentFolder=0, AllFolders=1, AllOutlookItems=2, Subfolders=3 (per MS docs)
+    switch ($Scope) {
+        'CurrentFolder' { return 0 }
+        'Subfolders' { return 3 }
+        'AllOutlookItems' { return 2 }
+        default { return 1 }
+    }
+}
+
+function Invoke-OutlookSearch {
+    # Drives Outlook's own Instant Search box rather than rendering results ourselves.
+    # We force a mail context (Inbox) so AllFolders scopes across mail folders, then
+    # activate the window so the user lands inside Outlook looking at live results.
+    param(
+        [Parameter(Mandatory = $true)] [object] $Application,
+        [Parameter(Mandatory = $true)] [string] $Query,
+        [ValidateSet('CurrentFolder', 'AllFolders', 'Subfolders', 'AllOutlookItems')]
+        [string] $Scope = 'AllFolders'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Query)) {
+        throw 'Query is required when searching Outlook.'
+    }
+
+    $namespace = $Application.GetNamespace('MAPI')
+    $inbox = $namespace.GetDefaultFolder(6)   # olFolderInbox = 6
+
+    $warning = $null
+    $explorer = $Application.ActiveExplorer()
+    if ($null -eq $explorer) {
+        # No window open yet (e.g. Outlook was just started by the COM bind): open one
+        # on the Inbox so there is an Explorer whose Search box we can drive.
+        $explorer = $inbox.GetExplorer()
+        $explorer.Display()
+    }
+    else {
+        # Force a mail context so AllFolders search stays within mail rather than whatever module
+        # (calendar/tasks) happened to be showing. If this fails the search still runs, but against
+        # the current view — report that instead of silently swallowing it.
+        try { $explorer.CurrentFolder = $inbox }
+        catch { $warning = "Could not switch to the Inbox; search ran in the current Outlook view instead. $($_.Exception.Message)" }
+    }
+
+    $explorer.Activate()
+    $scopeValue = ConvertTo-OutlookSearchScope -Scope $Scope
+    $explorer.Search($Query.Trim(), $scopeValue)
+
+    [pscustomobject]@{
+        Query   = $Query.Trim()
+        Scope   = $Scope
+        Ok      = $true
+        Warning = $warning
+    }
+}
+
 function Invoke-OutlookDiagnostics {
     # Probes each COM step independently so a failure point is pinpointed rather
     # than collapsing into one opaque error. Never throws: returns a report object.
@@ -317,6 +400,12 @@ function Invoke-OutlookDiagnostics {
         TasksFolderName     = $null
         TaskCount           = $null
         IncompleteTaskCount = $null
+        InboxFolderName     = $null
+        InboxItemCount      = $null
+        AccountCount        = $null
+        StoreCount          = $null
+        ExplorerAvailable   = $null
+        ComApartmentState   = [System.Threading.Thread]::CurrentThread.GetApartmentState().ToString()
         PowerShellVersion   = $PSVersionTable.PSVersion.ToString()
         Is64BitProcess      = [Environment]::Is64BitProcess
         Steps               = $steps
@@ -392,6 +481,49 @@ function Invoke-OutlookDiagnostics {
         Add-DiagStep -Name 'Enumerate tasks' -Ok $false -Detail $_.Exception.Message
     }
 
+    # --- search-path probes: these confirm `os` Outlook search can drive the UI ---
+
+    try {
+        $inbox = $namespace.GetDefaultFolder(6)   # olFolderInbox = 6
+        $report.InboxFolderName = $inbox.Name
+        $report.InboxItemCount = [int] $inbox.Items.Count
+        Add-DiagStep -Name 'Get default Inbox folder (6)' -Ok $true -Detail "$($inbox.Name), $($report.InboxItemCount) items"
+    }
+    catch {
+        Add-DiagStep -Name 'Get default Inbox folder (6)' -Ok $false -Detail $_.Exception.Message
+    }
+
+    try {
+        $explorer = $application.ActiveExplorer()
+        $report.ExplorerAvailable = ($null -ne $explorer)
+        $detail = if ($null -ne $explorer) { 'active explorer present' } else { 'no active explorer (a new one is opened on search)' }
+        Add-DiagStep -Name 'ActiveExplorer available' -Ok $true -Detail $detail
+    }
+    catch {
+        $report.ExplorerAvailable = $false
+        Add-DiagStep -Name 'ActiveExplorer available' -Ok $false -Detail $_.Exception.Message
+    }
+
+    try {
+        $accounts = $namespace.Accounts
+        $report.AccountCount = [int] $accounts.Count
+        $names = @(foreach ($a in $accounts) { $a.DisplayName }) -join ', '
+        Add-DiagStep -Name 'Enumerate accounts' -Ok $true -Detail "$($report.AccountCount): $names"
+    }
+    catch {
+        Add-DiagStep -Name 'Enumerate accounts' -Ok $false -Detail $_.Exception.Message
+    }
+
+    try {
+        $stores = $namespace.Stores
+        $report.StoreCount = [int] $stores.Count
+        $names = @(foreach ($s in $stores) { $s.DisplayName }) -join ', '
+        Add-DiagStep -Name 'Enumerate stores' -Ok $true -Detail "$($report.StoreCount): $names"
+    }
+    catch {
+        Add-DiagStep -Name 'Enumerate stores' -Ok $false -Detail $_.Exception.Message
+    }
+
     $report.Ok = $true
     return [pscustomobject]$report
 }
@@ -413,7 +545,7 @@ function Write-QuickTodoOutput {
 function Invoke-QuickTodoOutlookTaskCommand {
     [CmdletBinding()]
     param(
-        [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete', 'diag')]
+        [ValidateSet('add', 'list', 'complete', 'incomplete', 'rename', 'delete', 'diag', 'search')]
         [string] $Command = 'list',
         [string] $Subject,
         [string] $Body,
@@ -425,6 +557,9 @@ function Invoke-QuickTodoOutlookTaskCommand {
         [string] $Recurrence = 'None',
         [string] $EntryId,
         [string] $StoreId,
+        [string] $Query,
+        [ValidateSet('CurrentFolder', 'AllFolders', 'Subfolders', 'AllOutlookItems')]
+        [string] $Scope = 'AllFolders',
         [switch] $IncludeCompleted,
         [switch] $AsJson
     )
@@ -439,47 +574,61 @@ function Invoke-QuickTodoOutlookTaskCommand {
     $application = Get-OutlookApplication
     $namespace = Get-OutlookNamespace -Application $application
 
-    switch ($Command) {
-        'add' {
-            $addParams = @{
-                Application = $application
-                Subject = $Subject
-                Importance = $Importance
-            }
+    try {
+        switch ($Command) {
+            'add' {
+                $addParams = @{
+                    Application = $application
+                    Subject = $Subject
+                    Importance = $Importance
+                }
 
-            if ($PSBoundParameters.ContainsKey('Body')) {
-                $addParams.Body = $Body
-            }
-            if ($PSBoundParameters.ContainsKey('DueDate')) {
-                $addParams.DueDate = $DueDate
-            }
-            if ($PSBoundParameters.ContainsKey('Categories')) {
-                $addParams.Categories = $Categories
-            }
-            if ($PSBoundParameters.ContainsKey('Recurrence')) {
-                $addParams.Recurrence = $Recurrence
-            }
+                if ($PSBoundParameters.ContainsKey('Body')) {
+                    $addParams.Body = $Body
+                }
+                if ($PSBoundParameters.ContainsKey('DueDate')) {
+                    $addParams.DueDate = $DueDate
+                }
+                if ($PSBoundParameters.ContainsKey('Categories')) {
+                    $addParams.Categories = $Categories
+                }
+                if ($PSBoundParameters.ContainsKey('Recurrence')) {
+                    $addParams.Recurrence = $Recurrence
+                }
 
-            Write-QuickTodoOutput -Value (New-OutlookTask @addParams) -AsJson:$AsJson
+                Write-QuickTodoOutput -Value (New-OutlookTask @addParams) -AsJson:$AsJson
+            }
+            'list' {
+                Write-QuickTodoOutput -Value (Get-OutlookTasks -Namespace $namespace -IncludeCompleted:$IncludeCompleted) -AsJson:$AsJson
+            }
+            'complete' {
+                $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
+                Write-QuickTodoOutput -Value (Set-OutlookTaskComplete -Task $task -Complete $true) -AsJson:$AsJson
+            }
+            'incomplete' {
+                $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
+                Write-QuickTodoOutput -Value (Set-OutlookTaskComplete -Task $task -Complete $false) -AsJson:$AsJson
+            }
+            'rename' {
+                $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
+                Write-QuickTodoOutput -Value (Rename-OutlookTask -Task $task -Subject $Subject) -AsJson:$AsJson
+            }
+            'delete' {
+                $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
+                Write-QuickTodoOutput -Value (Remove-OutlookTask -Task $task -EntryId $EntryId -StoreId $StoreId) -AsJson:$AsJson
+            }
+            'search' {
+                Write-QuickTodoOutput -Value (Invoke-OutlookSearch -Application $application -Query $Query -Scope $Scope) -AsJson:$AsJson
+            }
         }
-        'list' {
-            Write-QuickTodoOutput -Value (Get-OutlookTasks -Namespace $namespace -IncludeCompleted:$IncludeCompleted) -AsJson:$AsJson
-        }
-        'complete' {
-            $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
-            Write-QuickTodoOutput -Value (Set-OutlookTaskComplete -Task $task -Complete $true) -AsJson:$AsJson
-        }
-        'incomplete' {
-            $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
-            Write-QuickTodoOutput -Value (Set-OutlookTaskComplete -Task $task -Complete $false) -AsJson:$AsJson
-        }
-        'rename' {
-            $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
-            Write-QuickTodoOutput -Value (Rename-OutlookTask -Task $task -Subject $Subject) -AsJson:$AsJson
-        }
-        'delete' {
-            $task = Get-OutlookTaskById -Namespace $namespace -EntryId $EntryId -StoreId $StoreId
-            Write-QuickTodoOutput -Value (Remove-OutlookTask -Task $task -EntryId $EntryId -StoreId $StoreId) -AsJson:$AsJson
+    }
+    finally {
+        # Quit only an instance THIS process started, and only for the one-shot commands. The
+        # `search` path deliberately leaves its (visible) Outlook open; `list` leaves a self-started
+        # instance running so the frequent 5s-cached refetches attach to it rather than churning
+        # Outlook start/quit on every poll.
+        if ($script:OutlookStartedByUs -and $Command -notin @('list', 'search')) {
+            try { $application.Quit() } catch { }
         }
     }
 }

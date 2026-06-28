@@ -14,6 +14,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
     private TodoStore _store = null!;
     private OutlookTaskScriptClient _outlookTasks = null!;
     private QueryHandler _queryHandler = null!;
+    private IconLoader _iconLoader = null!;
     private ReminderService _reminderService = null!;
     private QuickTodoSettings _settings = null!;
     private SettingsViewModel _settingsViewModel = null!;
@@ -23,7 +24,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
     {
         _context = context;
 
-        RegisterOutlookActionKeyword(context);
+        RegisterRuntimeActionKeywords(context);
 
         _settings = context.API.LoadSettingJsonStorage<QuickTodoSettings>();
 
@@ -32,11 +33,14 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
         _store.Load();
 
         _outlookTasks = new OutlookTaskScriptClient(
-            Path.Combine(AppContext.BaseDirectory, "Scripts", "QuickTodo.OutlookTasks.ps1"),
+            // PluginDirectory, not AppContext.BaseDirectory: the latter resolves to Flow
+            // Launcher's own app folder (no Scripts there), so the bridge script was never found.
+            Path.Combine(context.CurrentPluginMetadata.PluginDirectory, "Scripts", "QuickTodo.OutlookTasks.ps1"),
             logWarn: (cls, msg) => context.API.LogWarn(cls, msg),
             logInfo: (cls, msg) => context.API.LogInfo(cls, msg));
 
-        _queryHandler = new QueryHandler(_store, context, _outlookTasks);
+        _iconLoader = new IconLoader(context.CurrentPluginMetadata.PluginDirectory);
+        _queryHandler = new QueryHandler(_store, context, _iconLoader, _outlookTasks);
 
         _reminderService = new ReminderService(
             _store,
@@ -53,29 +57,43 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
         return Task.CompletedTask;
     }
 
-    // Registers the dedicated "tdo" keyword so it goes straight to Outlook mode,
-    // alongside the default "td" keyword from plugin.json. Idempotent across restarts,
-    // and skips registration if another plugin already owns the keyword.
-    private static void RegisterOutlookActionKeyword(PluginInitContext context)
+    // Registers the dedicated runtime keywords ("tdo" → Outlook tasks, "os" → Outlook
+    // search) alongside the default "td" keyword from plugin.json. Idempotent across
+    // restarts, and skips any keyword another plugin already owns.
+    private static void RegisterRuntimeActionKeywords(PluginInitContext context)
     {
         var meta = context.CurrentPluginMetadata;
-        if (meta.ActionKeywords.Contains(QueryHandler.OutlookActionKeyword))
-            return;
-        if (context.API.ActionKeywordAssigned(QueryHandler.OutlookActionKeyword))
-            return;
+        foreach (var keyword in new[] { QueryHandler.OutlookActionKeyword, QueryHandler.SearchActionKeyword })
+        {
+            if (meta.ActionKeywords.Contains(keyword))
+                continue;
+            if (context.API.ActionKeywordAssigned(keyword))
+            {
+                // Another plugin owns this keyword; don't clobber it. Log so the resulting dead
+                // feature (e.g. `os` search becoming unreachable) is diagnosable from the FL log.
+                context.API.LogWarn(nameof(Main),
+                    $"Action keyword '{keyword}' is already assigned to another plugin; the QuickTodo feature for it is disabled.");
+                continue;
+            }
 
-        context.API.AddActionKeyword(meta.ID, QueryHandler.OutlookActionKeyword);
+            context.API.AddActionKeyword(meta.ID, keyword);
+        }
     }
 
     public Task<List<Result>> QueryAsync(Query query, CancellationToken token)
     {
-        return Task.FromResult(_queryHandler.Handle(query));
+        return Task.FromResult(_iconLoader.Apply(_queryHandler.Handle(query)));
     }
 
     public List<Result> LoadContextMenus(Result selectedResult)
     {
         if (selectedResult.ContextData is not TodoItem contextTask)
             return new List<Result>();
+
+        // Outlook-backed tasks (identified by EntryId, not in the local store) get their own
+        // menu — toggle done + delete — instead of the local-task actions below.
+        if (!string.IsNullOrWhiteSpace(contextTask.OutlookEntryId))
+            return _iconLoader.Apply(_queryHandler.BuildOutlookContextMenus(contextTask));
 
         // Re-fetch from store to get fresh state. A null local lookup means this is
         // an Outlook-backed task (not in the local store), so local-only actions are gated.
@@ -88,7 +106,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
         results.Add(new Result
         {
             Title = task.IsCompleted ? "Mark Incomplete" : "Mark Complete",
-            IcoPath = "Images\\todo-done.png",
+            IcoPath = "Images\\td-done.png",
             Action = _ =>
             {
                 _store.ToggleComplete(task.Id);
@@ -121,7 +139,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
             results.Add(new Result
             {
                 Title = $"{prefix}Category: {cat}",
-                IcoPath = "Images\\todo.png",
+                IcoPath = "Images\\td.png",
                 Action = _ =>
                 {
                     _store.SetCategory(task.Id, cat);
@@ -136,7 +154,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
         {
             Title = "Set Due Date",
             SubTitle = "Type a date after #",
-            IcoPath = "Images\\todo.png",
+            IcoPath = "Images\\td.png",
             Action = _ =>
             {
                 _context.API.ChangeQuery($"td {task.Title} #");
@@ -151,7 +169,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
             {
                 Title = "Edit Task",
                 SubTitle = "Change title, priority, category, due date, or recurrence",
-                IcoPath = "Images\\todo.png",
+                IcoPath = "Images\\td.png",
                 Action = _ =>
                 {
                     _context.API.ChangeQuery($"td edit {task.Id} {task.Title}");
@@ -165,7 +183,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
         {
             Title = "Delete Task",
             SubTitle = task.Title,
-            IcoPath = "Images\\todo-high.png",
+            IcoPath = "Images\\td-high.png",
             Action = _ =>
             {
                 _store.Delete(task.Id);
@@ -174,7 +192,7 @@ public class Main : IAsyncPlugin, IContextMenu, ISettingProvider, IDisposable
             }
         });
 
-        return results;
+        return _iconLoader.Apply(results);
     }
 
     public Control CreateSettingPanel()

@@ -29,7 +29,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Flow.Launcher.Plugin" Version="5.2.0" />
+    <!-- Test wiring: reference THIS dev build's local Plugin assembly, which has the new
+         ReloadResultImage API. The published NuGet (5.2.0) does not. Revert to the
+         PackageReference below before releasing the plugin standalone:
+         <PackageReference Include="Flow.Launcher.Plugin" Version="5.2.0" /> -->
+    <Reference Include="Flow.Launcher.Plugin">
+      <HintPath>..\Flow.Launcher\Output\Debug\Flow.Launcher.Plugin.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
     <PackageReference Include="Microsoft.Toolkit.Uwp.Notifications" Version="7.1.3" />
   </ItemGroup>
 

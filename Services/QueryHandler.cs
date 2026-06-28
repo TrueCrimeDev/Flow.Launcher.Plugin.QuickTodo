@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Flow.Launcher.Plugin;
@@ -14,9 +15,41 @@ public class QueryHandler
     /// </summary>
     public const string OutlookActionKeyword = "tdo";
 
+    /// <summary>
+    /// Dedicated action keyword for Outlook search: <c>os &lt;term&gt;</c> drives Outlook's
+    /// Instant Search over mail. Registered automatically in <see cref="Main.InitAsync"/>.
+    /// </summary>
+    public const string SearchActionKeyword = "os";
+
+    /// <summary>Outlook-styled icon (solid blue notebook) shown throughout tdo / Outlook mode.</summary>
+    public const string OutlookIcon = "Images\\tdo.png";
+
+    /// <summary>Per-task check icons for the tdo list: filled check when complete, hollow dot when not.</summary>
+    public const string CheckedIcon = "Images\\tdo-checked.png";
+    public const string UncheckedIcon = "Images\\tdo-unchecked.png";
+
     private readonly TodoStore _store;
     private readonly PluginInitContext _context;
+    private readonly IconLoader _iconLoader;
     private readonly OutlookTaskScriptClient? _outlookTasks;
+
+    // Outlook reads go through a (possibly slow / 30s-on-failure) COM bridge. To keep the
+    // query thread from blocking — which freezes FL and makes "tdo" fall through to global
+    // results — the list is fetched on a background thread and cached. A query returns the
+    // cache (or a "Loading…" row) immediately; when the fetch finishes we ReQuery so the
+    // normal render path picks up the fresh data. Both success and error are cached for a
+    // short TTL so a closed Outlook doesn't trigger a tight 30s-retry loop.
+    private static readonly long OutlookCacheTtlMs = (long)TimeSpan.FromSeconds(5).TotalMilliseconds;
+    private readonly object _outlookCacheLock = new();
+    private List<TodoItem>? _outlookCacheTasks;
+    private string? _outlookCacheError;
+    // Environment.TickCount64 (monotonic) at the last publish; null = never fetched / invalidated.
+    // Wall-clock (DateTime.Now) would freeze the cache if the clock stepped backwards (DST/NTP).
+    private long? _outlookCacheAtTicks;
+    private bool _outlookFetching;
+    // Bumped on every invalidation so an in-flight fetch can tell its snapshot is stale and refuse
+    // to publish a pre-mutation list over the invalidation.
+    private int _outlookCacheGeneration;
 
     private static readonly Regex PriorityRegex = new(
         @"!(h|high|m|medium|l|low)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -37,10 +70,11 @@ public class QueryHandler
     private static readonly Regex TimeHourRegex = new(
         @"^\d{1,2}$", RegexOptions.Compiled);
 
-    public QueryHandler(TodoStore store, PluginInitContext context, OutlookTaskScriptClient? outlookTasks = null)
+    public QueryHandler(TodoStore store, PluginInitContext context, IconLoader iconLoader, OutlookTaskScriptClient? outlookTasks = null)
     {
         _store = store;
         _context = context;
+        _iconLoader = iconLoader;
         _outlookTasks = outlookTasks;
     }
 
@@ -52,6 +86,10 @@ public class QueryHandler
         if (string.Equals(query.ActionKeyword, OutlookActionKeyword, StringComparison.OrdinalIgnoreCase))
             return BuildOutlookResults(search, OutlookActionKeyword);
 
+        // The dedicated "os" keyword routes straight to Outlook search.
+        if (string.Equals(query.ActionKeyword, SearchActionKeyword, StringComparison.OrdinalIgnoreCase))
+            return BuildOutlookSearchResults(search);
+
         if (string.IsNullOrEmpty(search))
             return BuildHomeResults();
 
@@ -59,6 +97,7 @@ public class QueryHandler
 
         return firstWord switch
         {
+            "help" or "?" => BuildHelpResults(),
             "list" => BuildListResults(query.SecondToEndSearch),
             "cat" => BuildCategoryResults(query.SecondToEndSearch),
             "edit" => BuildEditResults(query.SecondToEndSearch),
@@ -77,10 +116,26 @@ public class QueryHandler
         {
             Title = "Add a task...",
             SubTitle = "Type after 'td' to create a new task",
-            IcoPath = "Images\\todo.png",
+            IcoPath = "Images\\td.png",
             Score = 10000,
             AutoCompleteText = "td ",
+            Preview = MarkdownPreview(BuildListMarkdown()),
             Action = _ => false
+        });
+
+        results.Add(new Result
+        {
+            Title = "Help — all commands",
+            SubTitle = "Type 'td help' for the full command list",
+            IcoPath = "Images\\td.png",
+            Score = 50,
+            AutoCompleteText = "td help",
+            Preview = MarkdownPreview(BuildHelpMarkdown()),
+            Action = _ =>
+            {
+                _context.API.ChangeQuery("td help");
+                return false;
+            }
         });
 
         var overdue = _store.GetOverdue();
@@ -107,6 +162,70 @@ public class QueryHandler
 
         return results;
     }
+
+    // --- HELP MODE ---
+
+    // `td help` (or `td ?`) lists every command as navigable rows, each carrying the full
+    // markdown cheat-sheet in the preview pane. Selecting a row jumps into that mode.
+    private List<Result> BuildHelpResults()
+    {
+        var cheatSheet = MarkdownPreview(BuildHelpMarkdown());
+        var score = 1000;
+
+        Result Row(string title, string subTitle, string jumpTo, string icon) => new()
+        {
+            Title = title,
+            SubTitle = subTitle,
+            IcoPath = icon,
+            Score = score--,
+            AutoCompleteText = jumpTo,
+            Preview = cheatSheet,
+            Action = _ =>
+            {
+                _context.API.ChangeQuery(jumpTo);
+                return false;
+            }
+        };
+
+        return new List<Result>
+        {
+            Row("Add a task", "td <task> !h @Work #tomorrow@9am", "td ", "Images\\td.png"),
+            Row("List & filter tasks", "td list [text] @Cat !h overdue|done", "td list ", "Images\\td.png"),
+            Row("Categories", "td cat · td cat add <name> · td cat remove <name>", "td cat ", "Images\\td.png"),
+            Row("Edit a task", "td edit [text] — pick a task, then change it", "td edit ", "Images\\td.png"),
+            Row("Outlook tasks", "tdo <task> · tdo list · tdo diag", "tdo ", OutlookIcon),
+            Row("Search Outlook mail", "os <term> · os diag", "os ", OutlookIcon),
+        };
+    }
+
+    private static string BuildHelpMarkdown() => """
+        ## QuickTodo — Commands
+
+        ### Add a task
+        `td <task>` — create a task. Combine modifiers:
+        - `!h` `!m` `!l` — priority (high / medium / low)
+        - `@Category` — assign a category
+        - `#today` `#tomorrow` `#friday` `#2026-07-01` `#07-01` — due date
+        - `#daily` `#weekly` `#monthly` `#yearly` `#every-monday` — recurring
+        - `@14:30` `@9am` `@9` after a date — time (e.g. `#tomorrow@9am`)
+
+        *Example: `td Email Sarah !h @Work #tomorrow@9am`*
+
+        ### List & filter
+        `td list` · `td list <text>` · `td list @Cat` · `td list !h` · `td list overdue` · `td list done`
+
+        ### Categories
+        `td cat` · `td cat add <name>` · `td cat remove <name>`
+
+        ### Edit
+        `td edit` · `td edit <text>` — pick a task, then change its title + modifiers
+
+        ### Outlook tasks — `tdo`
+        `tdo <task>` · `tdo list` · `tdo diag`
+
+        ### Search Outlook mail — `os`
+        `os <term>` · `os diag`
+        """;
 
     // --- ADD MODE ---
 
@@ -137,6 +256,7 @@ public class QueryHandler
                 SubTitle = subTitle,
                 IcoPath = PriorityIcon(parsed.Priority),
                 Score = 5001,
+                Preview = MarkdownPreview(BuildAddMarkdown("Update task", parsed)),
                 Action = _ =>
                 {
                     if (parsed.DueDate.HasValue)
@@ -159,6 +279,7 @@ public class QueryHandler
             SubTitle = subTitle,
             IcoPath = PriorityIcon(parsed.Priority),
             Score = 5000,
+            Preview = MarkdownPreview(BuildAddMarkdown("New task", parsed)),
             Action = _ =>
             {
                 _store.Add(parsed.Title, parsed.Priority, parsed.Category, parsed.DueDate,
@@ -242,7 +363,8 @@ public class QueryHandler
             {
                 Title = "No tasks found",
                 SubTitle = string.IsNullOrEmpty(filter) ? "Add tasks with 'td <task name>'" : $"No matches for '{filter}'",
-                IcoPath = "Images\\todo.png"
+                IcoPath = "Images\\td.png",
+                Preview = MarkdownPreview(BuildListMarkdown())
             });
         }
 
@@ -265,7 +387,7 @@ public class QueryHandler
                 {
                     Title = $"Add category: {catName}",
                     SubTitle = "Press Enter to add",
-                    IcoPath = "Images\\todo.png",
+                    IcoPath = "Images\\td.png",
                     Score = 1000,
                     Action = _ =>
                     {
@@ -287,7 +409,7 @@ public class QueryHandler
                 {
                     Title = $"Remove category: {catName}",
                     SubTitle = "Press Enter to remove (fails if tasks use this category)",
-                    IcoPath = "Images\\todo.png",
+                    IcoPath = "Images\\td.png",
                     Score = 1000,
                     Action = _ =>
                     {
@@ -311,7 +433,7 @@ public class QueryHandler
             {
                 Title = cat,
                 SubTitle = $"{taskCount} task(s)",
-                IcoPath = "Images\\todo.png",
+                IcoPath = "Images\\td.png",
                 Score = score--,
                 AutoCompleteText = $"td list @{cat}",
                 Action = _ =>
@@ -363,7 +485,7 @@ public class QueryHandler
                     SubTitle = string.IsNullOrEmpty(filter)
                         ? "Add tasks with 'td <task>'"
                         : $"No matches for '{filter}'",
-                    IcoPath = "Images\\todo.png"
+                    IcoPath = "Images\\td.png"
                 }
             };
         }
@@ -400,7 +522,7 @@ public class QueryHandler
                 {
                     Title = "Type the new title and modifiers",
                     SubTitle = $"Editing: {target.Title}",
-                    IcoPath = "Images\\todo.png",
+                    IcoPath = "Images\\td.png",
                     Score = 5000,
                     Action = _ => false
                 }
@@ -461,7 +583,7 @@ public class QueryHandler
                 {
                     Title = "Outlook task bridge is not available",
                     SubTitle = "The plugin was not initialized with an Outlook task client",
-                    IcoPath = "Images\\todo-high.png",
+                    IcoPath = "Images\\td-high.png",
                     Score = 1000
                 }
             };
@@ -476,7 +598,7 @@ public class QueryHandler
                 {
                     Title = "Add Outlook task...",
                     SubTitle = $"Type: {prefix} <task> #tomorrow !high @Work",
-                    IcoPath = "Images\\todo.png",
+                    IcoPath = OutlookIcon,
                     Score = 1000,
                     AutoCompleteText = $"{prefix} ",
                     Action = _ => false
@@ -485,7 +607,7 @@ public class QueryHandler
                 {
                     Title = "List Outlook tasks",
                     SubTitle = $"Type: {prefix} list",
-                    IcoPath = "Images\\todo.png",
+                    IcoPath = OutlookIcon,
                     Score = 900,
                     AutoCompleteText = $"{prefix} list",
                     Action = _ =>
@@ -498,7 +620,7 @@ public class QueryHandler
                 {
                     Title = "Diagnose Outlook connection",
                     SubTitle = $"Type: {prefix} diag — probe the COM bridge step by step",
-                    IcoPath = "Images\\todo.png",
+                    IcoPath = OutlookIcon,
                     Score = 800,
                     AutoCompleteText = $"{prefix} diag",
                     Action = _ =>
@@ -526,6 +648,95 @@ public class QueryHandler
         return BuildOutlookAddResults(input);
     }
 
+    // --- OUTLOOK SEARCH MODE (os) ---
+
+    private List<Result> BuildOutlookSearchResults(string args)
+    {
+        if (_outlookTasks == null)
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Outlook bridge is not available",
+                    SubTitle = "The plugin was not initialized with an Outlook client",
+                    IcoPath = "Images\\td-high.png",
+                    Score = 1000
+                }
+            };
+        }
+
+        var term = args.Trim();
+        if (string.IsNullOrEmpty(term))
+        {
+            return new List<Result>
+            {
+                new()
+                {
+                    Title = "Search Outlook email…",
+                    SubTitle = "Type a word after 'os' to search your Outlook mail (supports from:, subject:)",
+                    IcoPath = OutlookIcon,
+                    Score = 1000,
+                    AutoCompleteText = "os ",
+                    Action = _ => false
+                },
+                new()
+                {
+                    Title = "Diagnose Outlook connection",
+                    SubTitle = "Type: os diag — probe the COM bridge step by step",
+                    IcoPath = OutlookIcon,
+                    Score = 900,
+                    AutoCompleteText = "os diag",
+                    Action = _ =>
+                    {
+                        _context.API.ChangeQuery("os diag");
+                        return false;
+                    }
+                }
+            };
+        }
+
+        // "os diag" shares the same step-by-step report as "tdo diag".
+        if (term.Equals("diag", StringComparison.OrdinalIgnoreCase))
+            return BuildOutlookDiagResults();
+
+        return new List<Result>
+        {
+            new()
+            {
+                Title = $"Search Outlook for \"{term}\"",
+                SubTitle = "Enter to run Outlook's search over your mail (all folders)",
+                IcoPath = OutlookIcon,
+                Score = 5000,
+                Action = _ =>
+                {
+                    // Run the COM bridge off the UI thread so Flow Launcher doesn't freeze while
+                    // Outlook (cold-)starts and runs the search. Errors and non-fatal warnings still
+                    // surface via ShowMsg, which works after the launcher has closed.
+                    Task.Run(() =>
+                    {
+                        try
+                        {
+                            var result = _outlookTasks!.Search(term);
+                            if (!string.IsNullOrWhiteSpace(result?.Warning))
+                                _context.API.ShowMsg("QuickTodo Outlook", result!.Warning!);
+                        }
+                        catch (TimeoutException)
+                        {
+                            _context.API.ShowMsg("QuickTodo Outlook",
+                                "Outlook is taking a while to start — it should open with your search shortly.");
+                        }
+                        catch (Exception ex)
+                        {
+                            _context.API.ShowMsg("QuickTodo Outlook", ex.Message);
+                        }
+                    });
+                    return true; // close the launcher so Outlook takes focus
+                }
+            }
+        };
+    }
+
     private List<Result> BuildOutlookAddResults(string input)
     {
         var parsed = ParseModifiers(input, validateCategory: false);
@@ -541,7 +752,7 @@ public class QueryHandler
             {
                 Title = $"Add to Outlook: {parsed.Title}",
                 SubTitle = string.Join(" | ", subParts),
-                IcoPath = PriorityIcon(parsed.Priority),
+                IcoPath = OutlookIcon,
                 Score = 5000,
                 Action = _ =>
                 {
@@ -549,6 +760,7 @@ public class QueryHandler
                     {
                         _outlookTasks!.Add(parsed.Title, parsed.Priority, parsed.Category,
                             parsed.DueDate, parsed.Recurrence);
+                        InvalidateOutlookCache();
                         _context.API.ShowMsg("QuickTodo Outlook", $"Added: {parsed.Title}");
                     }
                     catch (Exception ex)
@@ -563,49 +775,141 @@ public class QueryHandler
 
     private List<Result> BuildOutlookListResults()
     {
-        try
+        lock (_outlookCacheLock)
         {
-            var tasks = _outlookTasks!.List()
-                .OrderBy(t => t.DueDate ?? DateTime.MaxValue)
-                .ThenByDescending(t => t.Priority)
-                .ToList();
+            var hasData = _outlookCacheTasks != null || _outlookCacheError != null;
+            var cacheIsFresh = hasData
+                               && _outlookCacheAtTicks is long at
+                               && (Environment.TickCount64 - at) < OutlookCacheTtlMs;
 
-            if (tasks.Count == 0)
+            if (cacheIsFresh)
             {
-                return new List<Result>
-                {
-                    new()
-                    {
-                        Title = "No incomplete Outlook tasks found",
-                        SubTitle = "Add one with: td outlook <task>",
-                        IcoPath = "Images\\todo.png",
-                        Score = 1000
-                    }
-                };
+                return _outlookCacheTasks != null
+                    ? RenderOutlookList(_outlookCacheTasks)
+                    : OutlookErrorResults(_outlookCacheError!);
             }
 
-            var results = new List<Result>();
-            var score = 1000;
-            foreach (var task in tasks)
+            if (!_outlookFetching)
             {
-                results.Add(OutlookTaskToResult(task, score--));
+                _outlookFetching = true;
+                StartOutlookFetch();
             }
 
-            return results;
+            // Stale-while-revalidate: if a prior successful list is still held, render it while the
+            // background refetch runs rather than blanking to a "Loading…" row on every keystroke
+            // once the TTL lapses. The fetch's ReQuery swaps in fresh data when it lands.
+            if (_outlookCacheTasks != null)
+                return RenderOutlookList(_outlookCacheTasks);
         }
-        catch (Exception ex)
+
+        return new List<Result>
+        {
+            new()
+            {
+                Title = "Loading Outlook tasks…",
+                SubTitle = "Querying Outlook via the COM bridge",
+                IcoPath = OutlookIcon,
+                Score = 1000,
+                Action = _ => false
+            }
+        };
+    }
+
+    // Fetches the Outlook list off the query thread, caches the outcome, then ReQueries so
+    // BuildOutlookListResults re-runs and renders the cached data through the normal path.
+    // Caller holds _outlookCacheLock and has set _outlookFetching = true.
+    private void StartOutlookFetch()
+    {
+        var gen = _outlookCacheGeneration;
+        Task.Run(() =>
+        {
+            List<TodoItem>? tasks = null;
+            string? error = null;
+            try
+            {
+                tasks = _outlookTasks!.List(includeCompleted: true)
+                    .OrderBy(t => t.IsCompleted)                    // incomplete first, completed sink to the bottom
+                    .ThenBy(t => t.DueDate ?? DateTime.MaxValue)
+                    .ThenByDescending(t => t.Priority)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+            }
+
+            lock (_outlookCacheLock)
+            {
+                // A mutation (add/complete/delete) invalidated the cache while this read was in
+                // flight — its snapshot predates the change, so discard it and refetch instead of
+                // publishing stale data over the invalidation. _outlookFetching stays true.
+                if (gen != _outlookCacheGeneration)
+                {
+                    StartOutlookFetch();
+                    return;
+                }
+
+                _outlookCacheTasks = tasks;
+                _outlookCacheError = error;
+                _outlookCacheAtTicks = Environment.TickCount64;
+                _outlookFetching = false;
+            }
+
+            _context.API.ReQuery();
+        });
+    }
+
+    // Drops the cached list so the next `tdo list` refetches — call after a mutation
+    // (add / complete) so the change shows up immediately rather than after the TTL.
+    private void InvalidateOutlookCache()
+    {
+        lock (_outlookCacheLock)
+        {
+            _outlookCacheAtTicks = null;
+            _outlookCacheTasks = null;
+            _outlookCacheError = null;
+            _outlookCacheGeneration++;   // fence any in-flight fetch from republishing a pre-mutation snapshot
+        }
+    }
+
+    private List<Result> RenderOutlookList(List<TodoItem> tasks)
+    {
+        if (tasks.Count == 0)
         {
             return new List<Result>
             {
                 new()
                 {
-                    Title = "Unable to read Outlook tasks",
-                    SubTitle = ex.Message,
-                    IcoPath = "Images\\todo-high.png",
+                    Title = "No Outlook tasks found",
+                    SubTitle = "Add one with: tdo <task>",
+                    IcoPath = OutlookIcon,
                     Score = 1000
                 }
             };
         }
+
+        var results = new List<Result>();
+        var score = 1000;
+        foreach (var task in tasks)
+        {
+            results.Add(OutlookTaskToResult(task, score--));
+        }
+
+        return results;
+    }
+
+    private static List<Result> OutlookErrorResults(string message)
+    {
+        return new List<Result>
+        {
+            new()
+            {
+                Title = "Unable to read Outlook tasks",
+                SubTitle = message,
+                IcoPath = "Images\\td-high.png",
+                Score = 1000
+            }
+        };
     }
 
     // --- OUTLOOK DIAGNOSTICS ---
@@ -620,7 +924,7 @@ public class QueryHandler
                 {
                     Title = "Outlook task bridge is not available",
                     SubTitle = "The plugin was not initialized with an Outlook task client",
-                    IcoPath = "Images\\todo-high.png",
+                    IcoPath = "Images\\td-high.png",
                     Score = 1000
                 }
             };
@@ -639,7 +943,7 @@ public class QueryHandler
                 {
                     Title = "Outlook diagnostics failed to run",
                     SubTitle = $"{ex.Message} — Enter to copy details",
-                    IcoPath = "Images\\todo-high.png",
+                    IcoPath = "Images\\td-high.png",
                     Score = 5000,
                     Action = _ =>
                     {
@@ -657,7 +961,7 @@ public class QueryHandler
         {
             Title = diag.Ok ? "Outlook connection OK" : "Outlook connection FAILED",
             SubTitle = BuildDiagSummary(diag),
-            IcoPath = diag.Ok ? "Images\\todo-done.png" : "Images\\todo-high.png",
+            IcoPath = diag.Ok ? "Images\\td-done.png" : "Images\\td-high.png",
             Score = score--,
             Action = _ =>
             {
@@ -674,7 +978,7 @@ public class QueryHandler
             {
                 Title = $"{mark} {step.Name}",
                 SubTitle = string.IsNullOrWhiteSpace(step.Detail) ? "" : step.Detail,
-                IcoPath = step.Ok ? "Images\\todo-done.png" : "Images\\todo-high.png",
+                IcoPath = step.Ok ? "Images\\td-done.png" : "Images\\td-high.png",
                 Score = score--
             });
         }
@@ -685,7 +989,7 @@ public class QueryHandler
             {
                 Title = "Error detail",
                 SubTitle = diag.Error,
-                IcoPath = "Images\\todo-high.png",
+                IcoPath = "Images\\td-high.png",
                 Score = score--
             });
         }
@@ -701,6 +1005,11 @@ public class QueryHandler
         if (d.ProfileName != null) parts.Add($"profile: {d.ProfileName}");
         if (d.TasksFolderName != null) parts.Add($"folder: {d.TasksFolderName}");
         if (d.TaskCount.HasValue) parts.Add($"{d.IncompleteTaskCount}/{d.TaskCount} open");
+        if (d.InboxItemCount.HasValue) parts.Add($"inbox: {d.InboxItemCount}");
+        if (d.AccountCount.HasValue) parts.Add($"accounts: {d.AccountCount}");
+        if (d.StoreCount.HasValue) parts.Add($"stores: {d.StoreCount}");
+        if (d.ExplorerAvailable.HasValue) parts.Add($"explorer: {(d.ExplorerAvailable.Value ? "yes" : "no")}");
+        if (d.ComApartmentState != null) parts.Add(d.ComApartmentState);
         parts.Add($"PS {d.PowerShellVersion}");
         parts.Add(d.Is64BitProcess ? "x64" : "x86");
         return string.Join(" | ", parts) + " — Enter to copy JSON";
@@ -873,6 +1182,135 @@ public class QueryHandler
         return null;
     }
 
+    // --- MARKDOWN PREVIEW ---
+
+    /// <summary>Cap on completed tasks shown per category in the preview pane.</summary>
+    private const int MaxDonePerCategory = 5;
+
+    /// <summary>
+    /// Preview pane payload rendered as markdown. On Flow Launcher builds with
+    /// <see cref="PreviewContentType"/> support the pane auto-opens for these results;
+    /// older builds fall back to showing the description as plain text.
+    /// </summary>
+    private static Result.PreviewInfo MarkdownPreview(string markdown) => new()
+    {
+        Description = markdown,
+        ContentType = PreviewContentType.Markdown,
+    };
+
+    /// <summary>
+    /// Renders the whole local list as a markdown dashboard grouped by category.
+    /// <paramref name="highlightId"/> bolds the task the selected row refers to.
+    /// </summary>
+    private string BuildListMarkdown(Guid? highlightId = null)
+    {
+        var tasks = _store.GetAll();
+        var open = tasks.Count(t => !t.IsCompleted);
+        var done = tasks.Count - open;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"## Tasks — {open} open · {done} done");
+
+        if (tasks.Count == 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("*No tasks yet — type after `td` to add one.*");
+            return sb.ToString();
+        }
+
+        foreach (var group in tasks
+                     .GroupBy(t => t.Category, StringComparer.OrdinalIgnoreCase)
+                     .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            sb.AppendLine();
+            sb.AppendLine($"### {EscapeMarkdown(group.Key)}");
+
+            var ordered = group
+                .OrderBy(t => t.IsCompleted)
+                .ThenByDescending(t => t.Priority)
+                .ThenBy(t => t.DueDate ?? DateTime.MaxValue);
+
+            var doneShown = 0;
+            var doneHidden = 0;
+            foreach (var task in ordered)
+            {
+                if (task.IsCompleted && ++doneShown > MaxDonePerCategory)
+                {
+                    doneHidden++;
+                    continue;
+                }
+                AppendTaskLine(sb, task, task.Id == highlightId);
+            }
+
+            if (doneHidden > 0)
+                sb.AppendLine($"*…and {doneHidden} more done*  ");
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Add/Update preview: the task as it will be saved, then the current list for context.
+    /// </summary>
+    private string BuildAddMarkdown(string heading, ParsedInput parsed)
+    {
+        var meta = new List<string> { parsed.Priority.ToString(), parsed.Category };
+        if (parsed.DueDate.HasValue)
+            meta.Add($"due {FormatDuePreview(parsed.DueDate.Value, parsed.HasDueTime)}");
+        if (parsed.Recurrence != Recurrence.None)
+            meta.Add(RecurrenceLabel(parsed.Recurrence).ToLowerInvariant());
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"## {heading}");
+        sb.AppendLine();
+        sb.AppendLine($"☐ **{EscapeMarkdown(parsed.Title)}** — *{string.Join(" · ", meta)}*");
+
+        if (parsed.CategoryWarning != null)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"> ⚠ {EscapeMarkdown(parsed.CategoryWarning)}");
+        }
+
+        sb.AppendLine();
+        sb.Append(BuildListMarkdown());
+        return sb.ToString();
+    }
+
+    // Task lines are plain paragraph lines ending in a markdown hard break (two trailing
+    // spaces) — list syntax would add MdXaml's own bullet next to the ☐/☑ glyph.
+    private static void AppendTaskLine(StringBuilder sb, TodoItem task, bool highlight)
+    {
+        var title = EscapeMarkdown(task.Title);
+        if (task.IsCompleted)
+        {
+            sb.AppendLine($"☑ ~~{title}~~  ");
+            return;
+        }
+
+        var meta = new List<string> { task.Priority.ToString() };
+        if (task.DueDate.HasValue)
+            meta.Add(FormatDue(task));
+        if (task.Recurrence != Recurrence.None)
+            meta.Add(RecurrenceLabel(task.Recurrence).ToLowerInvariant());
+
+        sb.AppendLine(highlight
+            ? $"☐ **{title}** — *{string.Join(" · ", meta)}* ◀  "
+            : $"☐ {title} — *{string.Join(" · ", meta)}*  ");
+    }
+
+    /// <summary>Backslash-escapes characters MdXaml would treat as markup inside titles.</summary>
+    private static string EscapeMarkdown(string text)
+    {
+        var sb = new StringBuilder(text.Length);
+        foreach (var c in text)
+        {
+            if (c is '\\' or '*' or '_' or '`' or '#' or '[' or ']' or '~' or '>' or '|')
+                sb.Append('\\');
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
     private static string RecurrenceLabel(Recurrence r) => r switch
     {
         Recurrence.Daily => "Repeats daily",
@@ -914,21 +1352,39 @@ public class QueryHandler
 
     private Result TaskToResult(TodoItem task, string subTitle, int score)
     {
-        var prefix = task.IsCompleted ? "\u2713 " : "";
-        return new Result
+        // Completed tasks get the blue check (matches the tdo list); incomplete keep their
+        // priority-coloured icon so priority stays readable at a glance.
+        var result = new Result
         {
-            Title = $"{prefix}{task.Title}",
+            Title = task.Title,
             SubTitle = subTitle,
-            IcoPath = task.IsCompleted ? "Images\\todo-done.png" : PriorityIcon(task.Priority),
+            IcoPath = task.IsCompleted ? CheckedIcon : PriorityIcon(task.Priority),
             Score = score,
             ContextData = task,
-            Action = _ =>
-            {
-                _store.ToggleComplete(task.Id);
-                _context.API.ReQuery();
-                return false;
-            }
+            Preview = MarkdownPreview(BuildListMarkdown(task.Id)),
         };
+
+        result.Action = _ =>
+        {
+            _store.ToggleComplete(task.Id);
+
+            // Swap just this row's icon in place — no ReQuery — so the list does not rebuild
+            // and the preview pane does not flash. We set Result.Icon (not IcoPath) because the
+            // shell thumbnail provider is broken on this machine; ReloadResultImage then reloads
+            // this single row from the new icon source.
+            var completed = _store.GetById(task.Id)?.IsCompleted ?? task.IsCompleted;
+            var image = _iconLoader.LoadIcon(completed ? CheckedIcon : PriorityIcon(task.Priority));
+            if (image != null)
+            {
+                result.Icon = () => image;
+                result.IcoPath = string.Empty;
+            }
+
+            _context.API.ReloadResultImage(result);
+            return false;
+        };
+
+        return result;
     }
 
     private Result OutlookTaskToResult(TodoItem task, int score)
@@ -937,15 +1393,18 @@ public class QueryHandler
         {
             Title = task.Title,
             SubTitle = FormatSubTitle(task),
-            IcoPath = PriorityIcon(task.Priority),
+            IcoPath = task.IsCompleted ? CheckedIcon : UncheckedIcon,
             Score = score,
             ContextData = task,
             Action = _ =>
             {
+                var nowComplete = !task.IsCompleted;
                 try
                 {
-                    _outlookTasks!.SetComplete(task, complete: true);
-                    _context.API.ShowMsg("QuickTodo Outlook", $"Completed: {task.Title}");
+                    _outlookTasks!.SetComplete(task, complete: nowComplete);
+                    InvalidateOutlookCache();
+                    _context.API.ShowMsg("QuickTodo Outlook",
+                        nowComplete ? $"Completed: {task.Title}" : $"Marked incomplete: {task.Title}");
                     _context.API.ReQuery();
                 }
                 catch (Exception ex)
@@ -953,6 +1412,62 @@ public class QueryHandler
                     _context.API.ShowMsg("QuickTodo Outlook", ex.Message);
                 }
                 return false;
+            }
+        };
+    }
+
+    // Context menu (Shift+Enter) for an Outlook task: toggle done state + delete. Outlook
+    // tasks aren't in the local store, so Main routes them here instead of the local menu.
+    internal List<Result> BuildOutlookContextMenus(TodoItem task)
+    {
+        var willComplete = !task.IsCompleted;
+
+        return new List<Result>
+        {
+            new()
+            {
+                Title = willComplete ? "Mark Complete" : "Mark Incomplete",
+                SubTitle = willComplete
+                    ? "Check it off (stays in the list until deleted)"
+                    : "Move it back to your active tasks",
+                IcoPath = willComplete ? CheckedIcon : UncheckedIcon,
+                Action = _ =>
+                {
+                    try
+                    {
+                        _outlookTasks!.SetComplete(task, complete: willComplete);
+                        InvalidateOutlookCache();
+                        _context.API.ShowMsg("QuickTodo Outlook",
+                            willComplete ? $"Completed: {task.Title}" : $"Marked incomplete: {task.Title}");
+                        _context.API.ReQuery();
+                    }
+                    catch (Exception ex)
+                    {
+                        _context.API.ShowMsg("QuickTodo Outlook", ex.Message);
+                    }
+                    return false;
+                }
+            },
+            new()
+            {
+                Title = "Delete from Outlook",
+                SubTitle = task.Title,
+                IcoPath = "Images\\td-high.png",
+                Action = _ =>
+                {
+                    try
+                    {
+                        _outlookTasks!.Delete(task);
+                        InvalidateOutlookCache();
+                        _context.API.ShowMsg("QuickTodo Outlook", $"Deleted: {task.Title}");
+                        _context.API.ReQuery();
+                    }
+                    catch (Exception ex)
+                    {
+                        _context.API.ShowMsg("QuickTodo Outlook", ex.Message);
+                    }
+                    return false;
+                }
             }
         };
     }
@@ -1002,10 +1517,10 @@ public class QueryHandler
 
     internal static string PriorityIcon(Priority p) => p switch
     {
-        Priority.High => "Images\\todo-high.png",
-        Priority.Medium => "Images\\todo-medium.png",
-        Priority.Low => "Images\\todo-low.png",
-        _ => "Images\\todo.png"
+        Priority.High => "Images\\td-high.png",
+        Priority.Medium => "Images\\td-medium.png",
+        Priority.Low => "Images\\td-low.png",
+        _ => "Images\\td.png"
     };
 
     private static int PriorityScore(Priority p) => p switch
