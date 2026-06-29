@@ -1187,16 +1187,32 @@ public class QueryHandler
     /// <summary>Cap on completed tasks shown per category in the preview pane.</summary>
     private const int MaxDonePerCategory = 5;
 
+    // PreviewInfo.ContentType (and the PreviewContentType enum) is a fork-only addition for the
+    // markdown preview pane; the published Plugin API (NuGet 5.2.0) lacks it. Resolved by reflection
+    // against the running assembly so it compiles against NuGet yet still drives markdown on the fork.
+    private static readonly System.Reflection.PropertyInfo? ContentTypeProp =
+        typeof(Result.PreviewInfo).GetProperty("ContentType");
+
     /// <summary>
-    /// Preview pane payload rendered as markdown. On Flow Launcher builds with
-    /// <see cref="PreviewContentType"/> support the pane auto-opens for these results;
-    /// older builds fall back to showing the description as plain text.
+    /// Preview pane payload rendered as markdown. On Flow Launcher builds with markdown preview
+    /// support the pane auto-opens for these results; older builds fall back to showing the
+    /// description as plain text.
     /// </summary>
-    private static Result.PreviewInfo MarkdownPreview(string markdown) => new()
+    private static Result.PreviewInfo MarkdownPreview(string markdown)
     {
-        Description = markdown,
-        ContentType = PreviewContentType.Markdown,
-    };
+        var info = new Result.PreviewInfo { Description = markdown };
+
+        if (ContentTypeProp != null)
+        {
+            try
+            {
+                ContentTypeProp.SetValue(info, Enum.Parse(ContentTypeProp.PropertyType, "Markdown"));
+            }
+            catch { /* enum shape differs on this host — leave as plain text */ }
+        }
+
+        return info;
+    }
 
     /// <summary>
     /// Renders the whole local list as a markdown dashboard grouped by category.
@@ -1380,11 +1396,30 @@ public class QueryHandler
                 result.IcoPath = string.Empty;
             }
 
-            _context.API.ReloadResultImage(result);
+            TryReloadResultImage(result);
             return false;
         };
 
         return result;
+    }
+
+    // ReloadResultImage refreshes a single row's icon in place. It exists on the dev/fork build
+    // of Flow Launcher but not in the published Plugin API (NuGet 5.2.0), so we resolve it off the
+    // live API's concrete type by reflection: present on the fork → refresh in place; absent on
+    // standard FL → harmless no-op. Resolved once and cached.
+    private System.Reflection.MethodInfo? _reloadResultImage;
+    private bool _reloadResultImageResolved;
+
+    private void TryReloadResultImage(Result result)
+    {
+        if (!_reloadResultImageResolved)
+        {
+            _reloadResultImage = _context.API.GetType()
+                .GetMethod("ReloadResultImage", new[] { typeof(Result) });
+            _reloadResultImageResolved = true;
+        }
+
+        _reloadResultImage?.Invoke(_context.API, new object[] { result });
     }
 
     private Result OutlookTaskToResult(TodoItem task, int score)

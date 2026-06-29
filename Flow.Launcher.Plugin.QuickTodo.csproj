@@ -29,14 +29,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Test wiring: reference THIS dev build's local Plugin assembly, which has the new
-         ReloadResultImage API. The published NuGet (5.2.0) does not. Revert to the
-         PackageReference below before releasing the plugin standalone:
-         <PackageReference Include="Flow.Launcher.Plugin" Version="5.2.0" /> -->
-    <Reference Include="Flow.Launcher.Plugin">
-      <HintPath>..\Flow.Launcher\Output\Debug\Flow.Launcher.Plugin.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
+    <!-- Reference the published Plugin API so the plugin is store-shippable. The fork build
+         of Flow Launcher adds a ReloadResultImage method that NuGet 5.2.0 lacks; QueryHandler
+         calls it by reflection (present on the fork, harmless no-op on standard FL) so this
+         package reference compiles cleanly while keeping the fork's in-place icon refresh. -->
+    <PackageReference Include="Flow.Launcher.Plugin" Version="5.2.0" />
     <PackageReference Include="Microsoft.Toolkit.Uwp.Notifications" Version="7.1.3" />
   </ItemGroup>
 
